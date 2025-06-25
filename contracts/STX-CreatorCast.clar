@@ -95,3 +95,110 @@
         (try! (check-admin))
         (asserts! (<= new-fee u100) ERR-INVALID-PARAMS)
         (ok (var-set platform-fee new-fee))))
+
+(define-public (toggle-contract-pause)
+    (begin
+        (try! (check-admin))
+        (ok (var-set contract-paused (not (var-get contract-paused))))))
+
+(define-public (add-administrator (admin principal))
+    (begin
+        (try! (check-admin))
+        (asserts! (not (is-eq admin 'SP000000000000000000002Q6VF78)) ERR-INVALID-PARAMS)
+        (ok (map-set administrators admin true))))
+
+;;;;;;;;;;;;;;;;;;;;;;;
+;; Creator Functions ;;
+;;;;;;;;;;;;;;;;;;;;;;;
+
+(define-public (register-as-creator)
+    (begin
+        (asserts! (not (is-creator)) ERR-ALREADY-EXISTS)
+        (ok (map-set content-creators tx-sender true))))
+
+(define-public (upload-video (title (string-utf8 256)) 
+                           (description (string-utf8 1024)) 
+                           (content-hash (buff 32)) 
+                           (price uint))
+    (let ((video-id (var-get next-video-id)))
+        (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+        (asserts! (is-creator) ERR-NOT-AUTHORIZED)
+        (asserts! (> (len title) u0) ERR-INVALID-PARAMS)
+        (asserts! (> (len description) u0) ERR-INVALID-PARAMS)
+        (asserts! (not (is-eq content-hash 0x0000000000000000000000000000000000000000000000000000000000000000)) ERR-INVALID-PARAMS)
+        (asserts! (>= price u0) ERR-INVALID-PARAMS)
+        (map-set videos
+            { video-id: video-id }
+            {
+                creator: tx-sender,
+                title: title,
+                description: description,
+                content-hash: content-hash,
+                price: price,
+                created-at: stacks-block-height,
+                views: u0,
+                revenue: u0,
+                is-active: true
+            }
+        )
+        (var-set next-video-id (+ video-id u1))
+        (ok video-id)))
+
+;;;;;;;;;;;;;;;;;;;;
+;; User Functions ;;
+;;;;;;;;;;;;;;;;;;;;
+
+(define-public (purchase-video (video-id uint))
+    (let ((video (unwrap! (map-get? videos { video-id: video-id }) ERR-NOT-FOUND)))
+        (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+        (asserts! (< video-id (var-get next-video-id)) ERR-NOT-FOUND)
+        (asserts! (get is-active video) ERR-NOT-FOUND)
+
+        ;; Process payment
+        (try! (stx-transfer? (get price video) tx-sender (get creator video)))
+
+        ;; Update revenue tracking
+        (map-set videos 
+            { video-id: video-id }
+            (merge video { 
+                revenue: (+ (get revenue video) (get price video)),
+                views: (+ (get views video) u1)
+            })
+        )
+        (ok true)))
+
+(define-public (subscribe-premium (duration uint))
+    (let ((price (* duration u10000000)) ;; 10 STX per period
+          (expiry (+ stacks-block-height (* duration u144)))) ;; ~1 day blocks
+        (asserts! (not (var-get contract-paused)) ERR-CONTRACT-PAUSED)
+        (asserts! (> duration u0) ERR-INVALID-PARAMS)
+        (try! (stx-transfer? price tx-sender contract-owner))
+        (ok (map-set premium-subscribers 
+            tx-sender 
+            { subscription-expires: expiry }))))
+
+;;;;;;;;;;;;;;;;;;;;;;;
+;; Getter Functions ;;
+;;;;;;;;;;;;;;;;;;;;;;;
+
+(define-read-only (get-video-details (video-id uint))
+    (map-get? videos { video-id: video-id }))
+
+(define-read-only (get-creator-revenue (creator principal))
+    (default-to u0 (map-get? creator-revenue creator)))
+
+(define-read-only (is-premium-subscriber (user principal))
+    (let ((sub (default-to 
+            { subscription-expires: u0 } 
+            (map-get? premium-subscribers user))))
+        (> (get subscription-expires sub) stacks-block-height)))
+
+;;;;;;;;;;;;;;;;
+;; Initialize ;;
+;;;;;;;;;;;;;;;;
+
+;; Initialize contract owner as first administrator
+(map-set administrators contract-owner true)
+
+;; Initialize platform revenue
+(map-set platform-revenue "total" u0)
